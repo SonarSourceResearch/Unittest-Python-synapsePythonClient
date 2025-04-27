@@ -1,0 +1,102 @@
+# GitHub Action workflow for testing, building, and releasing the Synapse Python Client.
+
+# - all pushes, releases, and pull requests  are tested against unit tests, and additionally
+#     integration tests if account configuration secrets are available.
+# - releases are additionally packaged, uploaded as build and release artifacts,
+#     and deployed to pypi servers (test.pypi.org for prereleases, and pypi.org for releases)
+#     Release tags must conform to our semver versioning, e.g. v1.2.3 in order to be packaged
+#     for pypi deployment.
+# - all pushes to the `develop` branch of the repository trigger a docker build and push to ghcr.io
+#     with the image tag named after the sha of the commit,
+#     e.g. `ghcr.io/sage-bionetworks/synapsepythonclient:develop-abc123`
+# - all non-prerelease releases trigger a docker build and push to ghcr.io with the image tag named
+#     after the release tag, e.g. `ghcr.io/sage-bionetworks/synapsepythonclient:1.2.3`
+
+name: build
+
+on:
+  push:
+    # we test all pushed branches, but not tags.
+    # we only push tags with releases, and we handle releases explicitly
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+
+  release:
+    types:
+      - 'published'
+
+# Cancel any previous runs of this workflow that are still in progress.
+# This is to avoid running the same tests multiple times concurrently.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # run unit (and integration tests if account secrets available) on our build matrix
+  test:
+
+    strategy:
+      matrix:
+        os: [ubuntu-22.04]
+
+        # if changing the below change the run-integration-tests versions and the check-deploy versions
+        # Make sure that we are running the integration tests on the first and last versions of the matrix
+        python: ['3.13']
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: get-dependencies-location
+        shell: bash
+        run: |
+          SITE_PACKAGES_LOCATION=$(python -c "from sysconfig import get_path; print(get_path('purelib'))")
+          SITE_BIN_DIR=$(python3 -c "import os; import platform; import sysconfig; pre = sysconfig.get_config_var('prefix'); bindir = os.path.join(pre, 'Scripts' if platform.system() == 'Windows' else 'bin'); print(bindir)")
+          echo "site_packages_loc=$SITE_PACKAGES_LOCATION" >> $GITHUB_OUTPUT
+          echo "site_bin_dir=$SITE_BIN_DIR" >> $GITHUB_OUTPUT
+        id: get-dependencies
+
+      - name: Cache py-dependencies
+        id: cache-dependencies
+        uses: actions/cache@v4
+        env:
+          cache-name: cache-py-dependencies
+        with:
+          path: |
+            ${{ steps.get-dependencies.outputs.site_packages_loc }}
+            ${{ steps.get-dependencies.outputs.site_bin_dir }}
+          key: ${{ runner.os }}-${{ matrix.python }}-build-${{ env.cache-name }}-${{ hashFiles('setup.py') }}-v21
+
+      - name: Install py-dependencies
+        if: steps.cache-dependencies.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          pip install -e ".[boto3,pandas,pysftp,tests]"
+
+          # ensure that numpy c extensions are installed on windows
+          # https://stackoverflow.com/a/59346525
+          if [ "${{startsWith(runner.os, 'Windows')}}" == "true" ]; then
+            pip uninstall -y numpy
+            pip uninstall -y setuptools
+            pip install setuptools
+            pip install numpy
+          fi
+
+      - name: run-unit-tests
+        shell: bash
+        run: |
+          pytest -sv --cov-append --cov=. --cov-report xml tests/unit
+
+      - name: Archive code coverage results
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage-report
+          path: coverage.xml
